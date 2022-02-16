@@ -1,6 +1,6 @@
 import { config as dotEnvConfig } from "dotenv";
 dotEnvConfig();
-import { checkArbitrage } from "./inchPrice";
+import { checkArbitrage } from "./price/1inch";
 import {
   baseTokens,
   interval,
@@ -9,15 +9,14 @@ import {
   loanAmount,
   diffAmount,
 } from "./config";
-import { createRoutes, flashloan } from "./flashloan";
-import chalk = require("chalk");
+import { flashloan } from "./flashloan";
 import { expectAmountOut } from "./expect";
 import { getBigNumber } from "./utils";
 import { ethers } from "ethers";
 import { chalkDifference, chalkPercentage, chalkTime } from "./utils/chalk";
-
-const readline = require("readline");
-const { Table } = require("console-table-printer");
+import { flashloanTable, priceTable } from "./consoleUI/table";
+import { initPriceTable, renderTables } from "./consoleUI";
+import { createRoutes } from "./price/1inch/route";
 
 export const main = async () => {
   console.clear();
@@ -26,111 +25,18 @@ export const main = async () => {
 
   const [maxX, _] = process.stdout.getWindowSize();
 
-  const p = new Table({
-    // title: "Quotes",
-    columns: [
-      { name: "index", title: "#", alignment: "right" },
-
-      { name: "fromToken", title: "From", alignment: "left" },
-      { name: "fromAmount", title: "Amount", alignment: "right" },
-
-      { name: "toToken", title: "To", alignment: "left" },
-      { name: "toAmount", title: "Amount", alignment: "right" },
-
-      { name: "difference", title: "±", alignment: "right" },
-      { name: "percentage", title: "%", alignment: "right" },
-
-      { name: "log", title: "Log", alignment: "left", maxLen: maxX - 101 },
-
-      { name: "time", title: "Time", alignment: "right" },
-      { name: "timestamp", title: "Timestamp", alignment: "right" },
-    ],
-  });
-
-  const pp = new Table({
-    title: "Flash Loans",
-    columns: [
-      { name: "baseToken", title: "From", alignment: "left" },
-      { name: "tradingToken", title: "To", alignment: "left" },
-
-      { name: "amount", title: "Amount", alignment: "right" },
-
-      { name: "difference", title: "±", alignment: "right" },
-      { name: "percentage", title: "%", alignment: "right" },
-
-      {
-        name: "firstRoutes",
-        title: "First Routes",
-        alignment: "left",
-        maxLen: maxX / 2 - 78,
-      },
-      {
-        name: "secondRoutes",
-        title: "Second Routes",
-        alignment: "left",
-        maxLen: maxX / 2 - 79,
-      },
-
-      {
-        name: "txHash",
-        title: "Transaction Hash",
-        alignment: "left",
-      },
-
-      { name: "time", title: "Time", alignment: "right" },
-      { name: "timestamp", title: "Timestamp", alignment: "right" },
-    ],
-  });
+  const p = priceTable(maxX);
+  const pp = flashloanTable(maxX);
 
   let idx = 0;
-  baseTokens.forEach(async (baseToken) => {
-    tradingTokens.forEach(async (tradingToken) => {
-      if (baseToken.address > tradingToken.address) {
-        p.addRow({
-          index: idx,
-
-          fromToken: (baseToken === tradingToken
-            ? ""
-            : baseToken.symbol
-          ).padEnd(6),
-          toToken: (baseToken === tradingToken
-            ? ""
-            : tradingToken.symbol
-          ).padEnd(6),
-
-          fromAmount: "".padStart(7),
-          toAmount: "".padStart(7),
-
-          difference: "".padStart(7),
-          percentage: "".padStart(5),
-
-          time: "".padStart(6),
-          timestamp: "".padStart(24),
-        });
-
-        idx++;
-      }
-    });
-  });
+  initPriceTable(p, idx);
 
   idx = 0;
-  const renderTables = () => {
-    // console.clear();
-    readline.cursorTo(process.stdout, 0, 0);
-
-    p.printTable();
-
-    if (pp.table.rows.length > 0) {
-      pp.printTable();
-    }
-  };
-
-  renderTables();
-
+  renderTables(p, pp);
   // const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
   setInterval(() => {
-    renderTables();
+    renderTables(p, pp);
   }, renderInterval);
 
   baseTokens.forEach(async (baseToken) => {
@@ -162,7 +68,7 @@ export const main = async () => {
           const [isProfitable, firstProtocols, secondProtocols] =
             await checkArbitrage(baseToken, tradingToken, updateRow);
 
-          renderTables();
+          renderTables(p, pp);
 
           if (isProfitable && !isFlashLoaning) {
             if (firstProtocols && secondProtocols) {
@@ -170,13 +76,19 @@ export const main = async () => {
               const secondRoutes = createRoutes(secondProtocols);
 
               const bnLoanAmount = getBigNumber(loanAmount, baseToken.decimals);
-              // estimate the token amount you get atfer swaps
-              const bnExpectedAmountOut = await expectAmountOut(
-                firstRoutes,
-                bnLoanAmount
-              ).then((firstAmountOut) =>
-                expectAmountOut(secondRoutes, firstAmountOut)
-              );
+              let bnExpectedAmountOut = getBigNumber(0);
+              // double check the price by qeurying dex contracts
+              try {
+                bnExpectedAmountOut = await expectAmountOut(
+                  firstRoutes,
+                  bnLoanAmount
+                ).then((firstAmountOut) =>
+                  expectAmountOut(secondRoutes, firstAmountOut)
+                );
+              } catch (e) {
+                // skip flashloan when failed to estimate price
+                return;
+              }
               // check if the expected amount is larger than the loan amount
               const isOpportunity = bnLoanAmount
                 .add(getBigNumber(diffAmount, baseToken.decimals))
@@ -201,44 +113,49 @@ export const main = async () => {
 
                 const startTime = Date.now();
 
-                const tx = await flashloan(
-                  baseToken,
-                  firstRoutes,
-                  secondRoutes
-                );
+                try {
+                  const tx = await flashloan(
+                    baseToken,
+                    firstRoutes,
+                    secondRoutes
+                  );
 
-                pp.addRow({
-                  baseToken: baseToken.symbol.padEnd(6),
-                  tradingToken: tradingToken.symbol.padEnd(6),
+                  pp.addRow({
+                    baseToken: baseToken.symbol.padEnd(6),
+                    tradingToken: tradingToken.symbol.padEnd(6),
 
-                  amount: (amount || "").padStart(7),
-                  difference: (chalkDifference(difference) || "").padStart(6),
-                  percentage: (chalkPercentage(percentage) || "").padStart(4),
+                    amount: (amount || "").padStart(7),
+                    difference: (chalkDifference(difference) || "").padStart(6),
+                    percentage: (chalkPercentage(percentage) || "").padStart(4),
 
-                  firstRoutes: firstProtocols.map((routes) =>
-                    routes.map((hops) =>
-                      hops
-                        .map((swap) => swap.name.replace("POLYGON_", ""))
-                        .join(" → ")
-                    )
-                  ),
-                  secondRoutes: secondProtocols.map((routes) =>
-                    routes.map((hops) =>
-                      hops
-                        .map((swap) => swap.name.replace("POLYGON_", ""))
-                        .join(" → ")
-                    )
-                  ),
+                    firstRoutes: firstProtocols.map((routes) =>
+                      routes.map((hops) =>
+                        hops
+                          .map((swap) => swap.name.replace("POLYGON_", ""))
+                          .join(" → ")
+                      )
+                    ),
+                    secondRoutes: secondProtocols.map((routes) =>
+                      routes.map((hops) =>
+                        hops
+                          .map((swap) => swap.name.replace("POLYGON_", ""))
+                          .join(" → ")
+                      )
+                    ),
 
-                  txHash: tx.hash.padStart(66),
+                    txHash: tx.hash.padStart(66),
 
-                  time: chalkTime((Date.now() - startTime) / 1000).padStart(6),
-                  timestamp: new Date().toISOString(),
-                });
+                    time: chalkTime((Date.now() - startTime) / 1000).padStart(
+                      6
+                    ),
+                    timestamp: new Date().toISOString(),
+                  });
 
-                isFlashLoaning = false;
-
-                renderTables();
+                  renderTables(p, pp);
+                } catch (e) {
+                } finally {
+                  isFlashLoaning = false;
+                }
               }
             }
           }
